@@ -1,113 +1,126 @@
 package com.mauricio.deltaview
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.*
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
 import android.hardware.camera2.*
 import android.media.Image
 import android.media.ImageReader
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Size
 import android.view.Surface
-import android.view.TextureView
-import java.io.ByteArrayOutputStream
-import java.util.*
-import kotlin.math.abs
+import android.widget.ImageView
 
-class CameraHelper(private val context: Context, private val textureView: TextureView) {
+class CameraHelper(private val context: Context, private val imageView: ImageView) {
 
     private var cameraDevice: CameraDevice? = null
-    private var captureSession: CameraCaptureSession? = null
+    private lateinit var cameraCaptureSession: CameraCaptureSession
     private lateinit var imageReader: ImageReader
-    private var lastBitmap: Bitmap? = null
+    private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    private var handler: Handler
+    private var backgroundThread: HandlerThread = HandlerThread("CameraThread")
+    private var previousBitmap: Bitmap? = null
+
+    init {
+        backgroundThread.start()
+        handler = Handler(backgroundThread.looper)
+    }
 
     @SuppressLint("MissingPermission")
     fun startCamera() {
-        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val cameraId = manager.cameraIdList[0]
-        val characteristics = manager.getCameraCharacteristics(cameraId)
-        val streamConfigurationMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val previewSize = streamConfigurationMap?.getOutputSizes(ImageFormat.YUV_420_888)?.first() ?: Size(640, 480)
+        val cameraId = cameraManager.cameraIdList.firstOrNull() ?: return
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+        val streamConfigurationMap =
+            characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val previewSize = streamConfigurationMap?.getOutputSizes(ImageFormat.JPEG)?.first() ?: Size(640, 480)
 
-        imageReader = ImageReader.newInstance(previewSize.width, previewSize.height, ImageFormat.YUV_420_888, 2)
+        imageReader = ImageReader.newInstance(previewSize.width, previewSize.height, ImageFormat.JPEG, 2)
         imageReader.setOnImageAvailableListener({ reader ->
-            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-            val bitmap = image.toBitmap()
-            image.close()
+            val image = reader.acquireLatestImage()
+            image?.let {
+                val buffer = it.planes[0].buffer
+                val bytes = ByteArray(buffer.remaining())
+                buffer.get(bytes)
+                val currentBitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                it.close()
 
-            val diffBitmap = lastBitmap?.let { subtractBitmaps(bitmap, it) } ?: bitmap
-            lastBitmap = bitmap
+                val processedBitmap = previousBitmap?.let { prev ->
+                    subtractBitmaps(prev, currentBitmap)
+                } ?: currentBitmap
 
-            val canvas = textureView.lockCanvas()
-            canvas?.let {
-                it.drawBitmap(diffBitmap, null, Rect(0, 0, textureView.width, textureView.height), null)
-                textureView.unlockCanvasAndPost(it)
+                previousBitmap = currentBitmap
+
+                imageView.post {
+                    imageView.setImageBitmap(processedBitmap)
+                }
             }
-        }, null)
+        }, handler)
 
-        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-            override fun onOpened(device: CameraDevice) {
-                cameraDevice = device
-                createPreviewSession(previewSize)
+        cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+            override fun onOpened(camera: CameraDevice) {
+                cameraDevice = camera
+                val surface = imageReader.surface
+                val requestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                requestBuilder.addTarget(surface)
+
+                camera.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(session: CameraCaptureSession) {
+                        cameraCaptureSession = session
+                        session.setRepeatingRequest(requestBuilder.build(), null, handler)
+                    }
+
+                    override fun onConfigureFailed(session: CameraCaptureSession) {}
+                }, handler)
             }
 
-            override fun onDisconnected(device: CameraDevice) = device.close()
-            override fun onError(device: CameraDevice, error: Int) = device.close()
-        }, null)
+            override fun onDisconnected(camera: CameraDevice) {
+                camera.close()
+            }
+
+            override fun onError(camera: CameraDevice, error: Int) {
+                camera.close()
+            }
+        }, handler)
+    }
+
+    private fun subtractBitmaps(b1: Bitmap, b2: Bitmap): Bitmap {
+        val width = b1.width.coerceAtMost(b2.width)
+        val height = b1.height.coerceAtMost(b2.height)
+        val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+
+        val pixels1 = IntArray(width * height)
+        val pixels2 = IntArray(width * height)
+        b1.getPixels(pixels1, 0, width, 0, 0, width, height)
+        b2.getPixels(pixels2, 0, width, 0, 0, width, height)
+
+        val resultPixels = IntArray(width * height)
+        for (i in pixels1.indices) {
+            val r1 = (pixels1[i] shr 16) and 0xff
+            val g1 = (pixels1[i] shr 8) and 0xff
+            val b1c = pixels1[i] and 0xff
+
+            val r2 = (pixels2[i] shr 16) and 0xff
+            val g2 = (pixels2[i] shr 8) and 0xff
+            val b2c = pixels2[i] and 0xff
+
+            val r = (r1 - r2).coerceIn(0, 255)
+            val g = (g1 - g2).coerceIn(0, 255)
+            val b = (b1c - b2c).coerceIn(0, 255)
+
+            resultPixels[i] = (0xff shl 24) or (r shl 16) or (g shl 8) or b
+        }
+
+        result.setPixels(resultPixels, 0, width, 0, 0, width, height)
+        return result
     }
 
     fun stopCamera() {
-        captureSession?.close()
+        cameraCaptureSession.close()
         cameraDevice?.close()
         imageReader.close()
-    }
-
-    private fun createPreviewSession(previewSize: Size) {
-        val texture = textureView.surfaceTexture!!
-        texture.setDefaultBufferSize(previewSize.width, previewSize.height)
-        val previewSurface = Surface(texture)
-
-        val captureRequestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-        captureRequestBuilder.addTarget(previewSurface)
-        captureRequestBuilder.addTarget(imageReader.surface)
-
-        cameraDevice?.createCaptureSession(listOf(previewSurface, imageReader.surface),
-            object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(session: CameraCaptureSession) {
-                    captureSession = session
-                    captureRequestBuilder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                    session.setRepeatingRequest(captureRequestBuilder.build(), null, null)
-                }
-
-                override fun onConfigureFailed(session: CameraCaptureSession) {}
-            }, null)
-    }
-
-    private fun Image.toBitmap(): Bitmap {
-        val yBuffer = planes[0].buffer
-        val ySize = yBuffer.remaining()
-        val yData = ByteArray(ySize)
-        yBuffer.get(yData)
-
-        val yuvImage = YuvImage(yData, ImageFormat.NV21, width, height, null)
-        val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, width, height), 100, out)
-        val imageBytes = out.toByteArray()
-        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-    }
-
-    private fun subtractBitmaps(current: Bitmap, previous: Bitmap): Bitmap {
-        val result = Bitmap.createBitmap(current.width, current.height, Bitmap.Config.ARGB_8888)
-        for (x in 0 until current.width step 2) {
-            for (y in 0 until current.height step 2) {
-                val cPixel = current.getPixel(x, y)
-                val pPixel = previous.getPixel(x, y)
-                val r = abs(Color.red(cPixel) - Color.red(pPixel))
-                val g = abs(Color.green(cPixel) - Color.green(pPixel))
-                val b = abs(Color.blue(cPixel) - Color.blue(pPixel))
-                result.setPixel(x, y, Color.rgb(r, g, b))
-            }
-        }
-        return result
+        backgroundThread.quitSafely()
     }
 }

@@ -5,19 +5,20 @@ plugins {
 
 android {
     namespace = "com.mauricio.deltaview"
-    compileSdk = 36
+    compileSdk = 34
 
     defaultConfig {
         applicationId = "com.mauricio.deltaview"
         minSdk = 26
-        targetSdk = 36
+        targetSdk = 34
         versionCode = 1
         versionName = "1.0"
     }
 
     buildTypes {
-        release {
+        getByName("release") {
             isMinifyEnabled = false
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
 
